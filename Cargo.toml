@@ -1,0 +1,20 @@
+[package]
+name = "dyn-serve"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eyre = "0.6.12"
+form_urlencoded = "1.2.1"
+http-body-util = "0.1.1"
+hyper = { version = "1.3.1", features = ["full"] }
+hyper-util = "0.1.3"
+indoc = "2.0.5"
+opendal = { path = "../repo/core", features = ["services-fs"] }
+percent-encoding = "2.3.1"
+tokio = { version = "1.37.0", features = ["full"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+[profile.release]
+lto = true
