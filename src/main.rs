@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    fmt::Display,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, fmt::Display, net::SocketAddr, path::Path};
 
 use eyre::Result;
 use http_body_util::Full;
@@ -17,10 +12,12 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use indoc::formatdoc;
 use opendal::{EntryMode, ErrorKind, Operator, Scheme};
-use percent_encoding::percent_decode_str;
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet};
 use tokio::net::TcpListener;
-use tracing::{debug, error, info, level_filters::LevelFilter, trace};
+use tracing::{error, info, level_filters::LevelFilter, trace};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+const PATH_PERCENT_ENCODE_SET: &AsciiSet = &percent_encoding::NON_ALPHANUMERIC.remove(b'/');
 
 fn error_rp(
     status: StatusCode,
@@ -45,6 +42,14 @@ fn error_rp(
         "})))?)
 }
 
+fn normalize_path(path: impl AsRef<str>) -> String {
+    path.as_ref()
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<&str>>()
+        .join("/")
+}
+
 async fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>> {
     let method = req.method();
     trace!(%method);
@@ -64,11 +69,13 @@ async fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
         Some(scheme) => scheme,
         None => return error_rp(StatusCode::BAD_REQUEST, &[], "missing scheme"),
     };
+    let scheme_raw = scheme;
     let map = match path_parts.next() {
         Some(map) => map,
         None => return error_rp(StatusCode::BAD_REQUEST, &[], "missing map"),
     };
-    let path = path_parts.next().unwrap_or(".");
+    let map_raw = map;
+    let path = path_parts.next().unwrap_or("");
     trace!(?scheme, ?map, ?path);
 
     // url decode & parse
@@ -91,17 +98,18 @@ async fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
 
     let operator = match Operator::via_map(scheme, map) {
         Ok(operator) => operator,
-        Err(_e) => {
+        Err(e) => {
             return error_rp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &[],
-                "failed to create operator",
+                format!("failed to create operator: {}", e),
             );
         }
     };
     trace!(?operator);
 
-    let metadata = match operator.stat(&path).await {
+    let normalized = normalize_path(&path);
+    let metadata = match operator.stat(&normalized).await {
         Ok(metadata) => metadata,
         Err(e) => match e.kind() {
             ErrorKind::NotFound => return error_rp(StatusCode::NOT_FOUND, &[], e),
@@ -111,7 +119,20 @@ async fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
     };
     match metadata.mode() {
         EntryMode::FILE => {
-            let buf = match operator.read(&path).await {
+            if path != normalized {
+                return error_rp(
+                    StatusCode::PERMANENT_REDIRECT,
+                    &[(
+                        header::LOCATION,
+                        &format!(
+                            "/{scheme_raw}/{map_raw}/{}",
+                            utf8_percent_encode(&normalized, PATH_PERCENT_ENCODE_SET),
+                        ),
+                    )],
+                    "path is normalized",
+                );
+            }
+            let buf = match operator.read(&normalized).await {
                 Ok(buf) => buf,
                 Err(e) => match e.kind() {
                     ErrorKind::PermissionDenied => return error_rp(StatusCode::FORBIDDEN, &[], e),
@@ -121,8 +142,28 @@ async fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
             Ok(Response::new(Full::new(buf.to_bytes())))
         }
         EntryMode::DIR => {
-            let path = format!("{path}/");
-            let entries = match operator.list_with(&path).recursive(false).await {
+            let normalized = format!("{normalized}/");
+            if normalized != "/" && path != normalized {
+                return error_rp(
+                    StatusCode::PERMANENT_REDIRECT,
+                    &[(
+                        header::LOCATION,
+                        &format!(
+                            "/{scheme_raw}/{map_raw}/{}",
+                            utf8_percent_encode(&normalized, PATH_PERCENT_ENCODE_SET),
+                        ),
+                    )],
+                    "path is normalized",
+                );
+            }
+            if normalized == "/" && path != "" {
+                return error_rp(
+                    StatusCode::PERMANENT_REDIRECT,
+                    &[(header::LOCATION, &format!("/{scheme_raw}/{map_raw}/"))],
+                    "path is normalized",
+                );
+            }
+            let entries = match operator.list_with(&normalized).recursive(false).await {
                 Ok(entries) => entries,
                 Err(e) => match e.kind() {
                     ErrorKind::PermissionDenied => return error_rp(StatusCode::FORBIDDEN, &[], e),
@@ -132,13 +173,23 @@ async fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
             let entries = match entries
                 .into_iter()
                 .map(|entry| -> Option<String> {
-                    let entry = entry.path();
-                    trace!(entry = entry, base = &path);
-                    let relative_path = Path::new(entry)
-                        .strip_prefix(&path)
-                        .ok()?
-                        .to_str()
-                        .expect("path is invalid utf-8");
+                    let entry_path = entry.path();
+                    let mode = entry.metadata().mode();
+                    trace!(entry = entry_path, base = &normalized);
+                    let relative_path = if normalized == "/" {
+                        entry_path
+                    } else {
+                        let stripped = Path::new(entry_path)
+                            .strip_prefix(&normalized)
+                            .ok()?
+                            .to_str()
+                            .expect("path is invalid utf-8");
+                        if mode.is_dir() {
+                            &format!("{stripped}/")
+                        } else {
+                            stripped
+                        }
+                    };
                     trace!(relative_path);
                     Some(format!(
                         "<li><a href=\"{relative_path}\">{relative_path}</a></li>"
@@ -161,7 +212,7 @@ async fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
                     <head>
                     </head>
                     <body>
-                        <h1>Contents of {path}</h1>
+                        <h1>Contents of {normalized}</h1>
                         <ul>
                 {entries}
                         </ul>
