@@ -176,23 +176,28 @@ async fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
                     let entry_path = entry.path();
                     let mode = entry.metadata().mode();
                     trace!(entry = entry_path, base = &normalized);
-                    let relative_path = if normalized == "/" {
-                        entry_path
+                    let (href, special) = if normalized == "/" {
+                        if mode == EntryMode::Unknown {
+                            (entry_path.to_string(), true)
+                        } else {
+                            (entry_path.to_string(), false)
+                        }
                     } else {
                         let stripped = Path::new(entry_path)
                             .strip_prefix(&normalized)
                             .ok()?
                             .to_str()
                             .expect("path is invalid utf-8");
-                        if mode.is_dir() {
-                            &format!("{stripped}/")
-                        } else {
-                            stripped
+                        match mode {
+                            EntryMode::FILE => (stripped.to_string(), false),
+                            EntryMode::DIR => (format!("{stripped}/"), false),
+                            EntryMode::Unknown => (stripped.to_string(), true),
                         }
                     };
-                    trace!(relative_path);
+                    trace!(href, special);
                     Some(format!(
-                        "<li><a href=\"{relative_path}\">{relative_path}</a></li>"
+                        "<li><a href=\"{href}\">{href}</a>{}</li>",
+                        if special { " (*)" } else { "" }
                     ))
                 })
                 .collect::<Option<Vec<String>>>()
@@ -206,6 +211,7 @@ async fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
                     )
                 }
             };
+            info!(status = %StatusCode::OK);
             Ok(Response::new(Full::new(Bytes::from(formatdoc! {"
                 <!DOCTYPE html>
                 <html>
